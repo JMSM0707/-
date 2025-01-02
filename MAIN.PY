@@ -43,7 +43,7 @@ def main():
         
         service = Service(executable_path='chromedriver')  # Убедитесь, что путь к chromedriver верный
         driver = webdriver.Chrome(service=service, options=chrome_options)
-        driver.get('https://app.getgrass.io/dashboard')
+        driver.get('https://app.nodepay.ai/login')
 
         # Вводим данные для входа
         WebDriverWait(driver, 10).until(EC.presence_of_element_located((By.NAME, 'username'))).send_keys(username)
