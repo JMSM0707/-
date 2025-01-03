@@ -1,82 +1,276 @@
-import os
+import asyncio
 import requests
-from selenium import webdriver
-from selenium.webdriver.common.by import By
-from selenium.webdriver.common.keys import Keys
-from selenium.webdriver.chrome.service import Service
-from selenium.webdriver.chrome.options import Options
-from webdriver_manager.chrome import ChromeDriverManager
-import time
+from datetime import datetime
+from typing import Optional, Dict
+from colorama import Fore, Style, init
+from capmonster_python import TurnstileTask
+from twocaptcha import TwoCaptcha
+from anticaptchaofficial.turnstileproxyless import turnstileProxyless
 
-# Настройка прокси
-def get_proxies(file_path):
-    with open(file_path, 'r') as f:
-        return [line.strip() for line in f.readlines()]
+init(autoreset=True)
 
-# Получение аккаунтов
-def get_accounts(file_path):
-    with open(file_path, 'r') as f:
-        return [line.strip() for line in f.readlines()]
+# Utility logging function
+def log_step(message: str, type: str = "info"):
+    timestamp = datetime.now().strftime("%H:%M:%S")
+    colors = {
+        "info": Fore.LIGHTCYAN_EX,
+        "success": Fore.LIGHTGREEN_EX,
+        "error": Fore.LIGHTRED_EX,
+        "warning": Fore.LIGHTYELLOW_EX
+    }
+    color = colors.get(type, Fore.WHITE)
+    prefix = {
+        "info": "ℹ",
+        "success": "✓",
+        "error": "✗",
+        "warning": "⚠"
+    }
+    print(f"{Fore.WHITE}[{timestamp}] {color}{prefix.get(type, '•')} {message}{Style.RESET_ALL}")
 
-# Функция для решения капчи с помощью 2captcha
-def solve_captcha(api_key, site_key, url):
-    response = requests.post('http://2captcha.com/in.php', {
-        'key': api_key,
-        'method': 'userrecaptcha',
-        'googlekey': site_key,
-        'pageurl': url
-    })
-    captcha_id = response.text.split('|')[1]
-    time.sleep(20)  # Подождем решения капчи
-    solution_response = requests.get(f'http://2captcha.com/res.php?key={api_key}&action=get&id={captcha_id}')
-    return solution_response.text.split('|')[1]
+class CaptchaConfig:
+    WEBSITE_KEY = '0x4AAAAAAAx1CyDNL8zOEPe7'
+    WEBSITE_URL = 'https://app.nodepay.ai/login'
 
-# Основная функция для входа
-def login(account, proxy):
-    login_info = account.split(':')
-    username, password = login_info[0], login_info[1]
+class ServiceCapmonster:
+    def __init__(self, api_key):
+        self.capmonster = TurnstileTask(api_key)
 
-    options = Options()
-    options.add_argument(f'--proxy-server={proxy}')
-    driver = webdriver.Chrome(service=Service(ChromeDriverManager().install()), options=options)
+    async def get_captcha_token_async(self):
+        task_id = self.capmonster.create_task(
+            website_key=CaptchaConfig.WEBSITE_KEY,
+            website_url=CaptchaConfig.WEBSITE_URL
+        )
+        return self.capmonster.join_task_result(task_id).get("token")
+
+class ServiceAnticaptcha:
+    def __init__(self, api_key):
+        self.api_key = api_key
+        self.solver = turnstileProxyless()
+        self.solver.set_key(self.api_key)
+        self.solver.set_website_url(CaptchaConfig.WEBSITE_URL)
+        self.solver.set_website_key(CaptchaConfig.WEBSITE_KEY)
+        self.solver.set_action("login")
+
+    async def get_captcha_token_async(self):
+        return await asyncio.to_thread(self.solver.solve_and_return_solution)
+
+class Service2Captcha:
+    def __init__(self, api_key):
+        self.solver = TwoCaptcha(api_key)
+
+    async def get_captcha_token_async(self):
+        result = await asyncio.to_thread(
+            lambda: self.solver.turnstile(
+                sitekey=CaptchaConfig.WEBSITE_KEY,
+                url=CaptchaConfig.WEBSITE_URL
+            )
+        )
+        return result['code']
+
+class CaptchaServiceFactory:
+    @staticmethod
+    def create_service(service_name: str, api_key: str):
+        if service_name.lower() == "capmonster":
+            return ServiceCapmonster(api_key)
+        elif service_name.lower() == "anticaptcha":
+            return ServiceAnticaptcha(api_key)
+        elif service_name.lower() == "2captcha":
+            return Service2Captcha(api_key)
+        raise ValueError(f"Unknown service: {service_name}")
     
+class ProxyManager:
+    def __init__(self, proxy_list: list):
+        self.proxies = proxy_list
+        self.current_index = -1
+        self.total_proxies = len(proxy_list) if proxy_list else 0
+        self.current_session_proxy = None
+        
+        if self.total_proxies == 1:
+            log_step("Single proxy detected - will use the same proxy for all requests", "warning")
+        elif self.total_proxies > 1:
+            log_step(f"Multiple proxies detected ({self.total_proxies}) - will rotate proxies", "info")
+        else:
+            log_step("No proxies provided - will run without proxy", "warning")
+    
+    def get_next_proxy(self) -> Optional[Dict[str, str]]:
+        if not self.proxies:
+            return None
+        
+        if self.total_proxies == 1:
+            proxy = self.proxies[0]
+            self.current_session_proxy = {"http": proxy, "https": proxy}
+            log_step(f"Using single proxy: {proxy}", "warning")
+        else:
+            self.current_index = (self.current_index + 1) % self.total_proxies
+            proxy = self.proxies[self.current_index]
+            self.current_session_proxy = {"http": proxy, "https": proxy}
+            log_step(f"Using proxy: {proxy}", "warning")
+            
+        return self.current_session_proxy
+    
+    def start_new_session(self) -> Optional[Dict[str, str]]:
+        return self.get_next_proxy()
+    
+    def get_session_proxy(self) -> Optional[Dict[str, str]]:
+        return self.current_session_proxy
+
+    def get_current_ip(self) -> str:
+        try:
+            response = requests.get(
+                'https://api64.ipify.org?format=json',
+                proxies=self.current_session_proxy,
+                timeout=30
+            )
+            return response.json()['ip']
+        except Exception as e:
+            log_step(f"Failed to get IP address: {str(e)}", "error")
+            return "Unknown"
+
+class ApiEndpoints:
+    BASE_URL = "https://api.nodepay.ai/api"
+    
+    @classmethod
+    def get_url(cls, endpoint: str) -> str:
+        return f"{cls.BASE_URL}/{endpoint}"
+    
+    class Auth:
+        LOGIN = "auth/login"
+
+class ReferralClient:
+    def __init__(self, proxy_manager: Optional[ProxyManager] = None):
+        self.email = None
+        self.proxy_manager = proxy_manager
+        self.password = None
+        self.max_retries = 5
+
+    async def _get_captcha_with_retry(self, captcha_service) -> Optional[str]:
+        # Ambil token captcha
+        captcha_token = await captcha_service.get_captcha_token_async()
+        if not captcha_token:
+            log_step("Failed to get captcha token", "error")
+
+        return captcha_token
+
+    async def _make_request(self, method: str, endpoint: str, json_data: dict, auth_token: Optional[str] = None) -> dict:
+        headers = {
+            'Content-Type': 'application/json',
+            'User-Agent': 'Mozilla/5.0',
+            'Authorization': f'Bearer {auth_token}' if auth_token else '',
+        }
+        url = ApiEndpoints.get_url(endpoint)
+
+        try:
+            response = await asyncio.to_thread(
+                lambda: requests.request(
+                    method=method,
+                    url=url,
+                    headers=headers,
+                    json=json_data,
+                    timeout=30
+                )
+            )
+            return response.json()
+        except requests.exceptions.RequestException as e:
+            log_step(f"Request failed: {str(e)}", "error")
+            return {"success": False, "msg": str(e)}
+
+    async def login(self, email: str, password: str, captcha_service) -> Optional[str]:
+        for attempt in range(1, self.max_retries + 1):
+            try:
+                log_step(f"Login attempt {attempt} of {self.max_retries}...", "info")
+                
+                captcha_token = await self._get_captcha_with_retry(captcha_service)
+                if not captcha_token:
+                    continue
+                
+                json_data = {
+                    'user': email,
+                    'password': password,
+                    'remember_me': True,
+                    'recaptcha_token': captcha_token
+                }
+                
+                response = await self._make_request(
+                    method='POST',
+                    endpoint=ApiEndpoints.Auth.LOGIN,
+                    json_data=json_data
+                )
+                
+                
+                if response.get("success"):
+                    access_token = response['data']['token']
+                    log_step("Login successful", "success")
+                    return access_token
+
+                msg = response.get("msg", "Unknown login error")
+                log_step(f"Login failed on attempt {attempt}: {msg}", "error")
+                
+                if attempt == self.max_retries:
+                    return None
+                
+            except Exception as e:
+                log_step(f"Login error on attempt {attempt}: {str(e)}", "error")
+                if attempt == self.max_retries:
+                    return None
+        return None
+
+    async def process_login(self, email: str, password: str, captcha_service):
+        token = await self.login(email, password, captcha_service)
+        if token:
+            log_step(f"Token for {email}: {token}", "success")
+            with open('token_list.txt', 'a') as f:
+                f.write(f"{token}\n")
+        else:
+            log_step(f"Failed to get token for {email}", "error")
+
+async def main():
+    print(f"{Fore.GREEN}Auto GET Token Nodepay{Style.RESET_ALL}")
+    
+    # Choose captcha service
+    print(f"\n{Fore.YELLOW}Available captcha services:{Style.RESET_ALL}")
+    print(f"1. Capmonster")
+    print(f"2. Anticaptcha")
+    print(f"3. 2Captcha{Style.RESET_ALL}")
+    service_choice = input(f"{Fore.GREEN}Choose captcha service (1-3): {Style.RESET_ALL}")
+    api_key = input(f"{Fore.GREEN}Enter API key for captcha service: {Style.RESET_ALL}")
+
+    use_proxies = input(f"{Fore.GREEN}Use proxies? (yes/no): {Style.RESET_ALL}").lower() == 'yes'
+    proxy_manager = None
+    
+    if use_proxies:
+        try:
+            with open('proxy.txt', 'r') as f:
+                proxy_list = [line.strip() for line in f if line.strip()]
+            proxy_manager = ProxyManager(proxy_list)
+            log_step(f"Loaded {len(proxy_list)} proxies", "success")
+        except FileNotFoundError:
+            log_step("proxies.txt not found. Running without proxies.", "warning")
+
+    service_map = {
+        "1": "capmonster",
+        "2": "anticaptcha",
+        "3": "2captcha"
+    }
+
     try:
-        driver.get("https://app.getgrass.io/dashboard")
-        time.sleep(3)  # Дайте время загрузки страницы
+        captcha_service = CaptchaServiceFactory.create_service(service_map[service_choice], api_key)
+        log_step("Captcha service initialized", "success")
+    except Exception as e:
+        log_step(f"Failed to initialize captcha service: {str(e)}", "error")
+        return
 
-        # Вводим логин и пароль
-        driver.find_element(By.NAME, "username").send_keys(username)
-        driver.find_element(By.NAME, "password").send_keys(password + Keys.RETURN)
+    with open('accounts.txt', 'r') as f:
+        accounts = f.readlines()
+
+    client = ReferralClient()
+
+    for account in accounts:
+        email, password = account.strip().split(":")
         
-        time.sleep(5)  # Дайте время для возможного появления капчи
-
-        # Проверяем наличие капчи
-        if "captcha" in driver.page_source:
-            site_key = "здесь_должен_быть_site_key_капчи"  # нужно указать правильный site_key
-            web_url = driver.current_url
-            captcha_solution = solve_captcha("ваш_api_key_2captcha", site_key, web_url)
-            # Вставьте решение капчи в нужное поле
-        
-            # (Эти шаги могут меняться в зависимости от реализации сайта, возможно, вам нужно будет отредактировать их)
-
-        time.sleep(5)  # Дайте время на загрузку после входа
-
-        # Получаем токен
-        token = driver.execute_script("return localStorage.getItem('np_token');")
-
-        # Сохранить токен в файл
-        with open('np_token.txt', 'a') as f:
-            f.write(f'{username}: {token}\n')
-
-    finally:
-        driver.quit()
-
-def main():
-    accounts = get_accounts('accs/accounts.txt')
-    proxies = get_proxies('proxys/proxies.txt')
-
-    for account, proxy in zip(accounts, proxies):
-        login(account, proxy)
+        log_step(f"Processing login for {email}", "info")
+        await client.process_login(email, password, captcha_service)
+    
+    log_step("All logins processed.", "info")
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(main())
